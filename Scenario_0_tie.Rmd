@@ -1,0 +1,506 @@
+
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+library(ggplot2)
+library(patchwork)
+library(tidyr)
+library(survival)
+library(mvtnorm)
+library(lubridate)
+library(survival)
+library(survminer)
+library(rpact)
+library(dplyr)
+library(Hmisc)
+library(gtsummary)
+library(gsDesign)
+library(dplyr)
+library(RColorBrewer)
+```
+
+# SAMPLE SIZE (Fixed)
+
+```{r, echo=FALSE, warning = FALSE}
+# Inputs
+zb <- -0.84        # Z-score for power (e.g., 80% power)
+za <- -1.645       # Z-score for significance level (e.g., alpha = 0.05)
+HR1 <- 1      
+HR0 =  1.25  # Hazard ratio under alternative hypothesis
+#m   = 0.3           # non-inferiority margin
+pi <- 0.5         # Allocation ratio (e.g., 1:1 randomization)
+pa=1             # probability of NOT censoring in arm A
+pb=1           # probability of NOT censoring in arm B
+
+A = (za+zb)^2 
+B= log(HR0)^2*pi*(1-pi)
+
+E=ceiling(A/B)
+E
+```
+
+# SCENARIO 0 (null hypothesis): INDEPENDENCE BETWEEN PRIMARY AND SECONDARY ENDPOINT
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+set.seed(345)
+num_reps <- 5
+
+#INPUT
+
+  alpha=0.05
+  beta=0.2
+  start_study <- as.Date("2025/01/01")
+  tot_time=60 #months
+  enrol_time=48 #months
+  fu_time=12 #months
+  fu_days=12*30
+  time=c(0.20, 0.30, 0.40, 0.5)
+  interim_time=tot_time*time
+  
+  # Calculate the AVERAGE TIME OF FOLLOW-UP AT INTERIM
+  avgtime=rep(0,length(time)) 
+  for (m in 1:length(time)) {
+  maxtime= interim_time[m]
+  times <- 0:(maxtime-1)
+  probs <- punif(times, 0, maxtime, lower.tail = FALSE) - punif(times + 1, 0, maxtime,   lower.tail = FALSE)
+  weights <- if (maxtime > fu_time) {
+    c(0:fu_time, rep(fu_time, maxtime - (fu_time+1)))
+  } else {
+    0:(maxtime - 1)
+  }
+  avgtime[m]=round(sum(probs * weights),2) #months
+  }
+  
+# PRE-DEFINED TIME POINT FOR ALLOCATION PROPORTION UPDATE (FUNCTION)
+generate_update_dates <- function(start_date, end_date, interval_months) {
+  start_date <- as.Date(start_date)
+  end_date <- as.Date(end_date)
+  interim_dates <- seq(from = start_date,
+                       to = end_date,
+                       by = paste(interval_months, "months"))
+
+  return(c(interim_dates, end_date))
+}
+  #ALLOCATION PROPORTION UPDATE EVERY 3 MONTHS
+  n_updates=3
+
+  median1=8 # average median in months PER EXPERIMANTAL PFS
+  median2=10 # PFS CONTROL
+  median_null=8
+  lambda=log(2)/median2 #average lambda monthly PFS
+  median1_drug = c(1.5, 2.25, 3.5, 6)
+  median2_drug = c(1.5, 1.5, 1.5, 1.5)
+  lambda1_drug= log(2)/median1_drug
+  lambda2_drug= log(2)/median2_drug
+  #OPT IS THE TARGET ALLOCATION PROPORTION
+  opt=(1/lambda1_drug)/((1/lambda1_drug)+(1/lambda2_drug))
+  margin=(1/(log(2)/(median2*30))) - (1/(log(2)/(median_null*30)))
+  
+
+  #PRESAVE VECTORS
+
+  allocation_prob=numeric(num_reps)
+  AE_num=numeric(num_reps)
+  Z1_cox_ney <- numeric(num_reps)
+  Z2_cox_ney <- numeric(num_reps)
+  mean_allocation_prob=matrix(NA, nrow = length(median1_drug), ncol = length(time))
+  mean_AE=matrix(NA, nrow = length(median1_drug), ncol = length(time))
+  sd_AE=matrix(NA, nrow = length(median1_drug), ncol = length(time))
+  power1_cox_ney=matrix(NA, nrow = length(median1_drug), ncol = length(time))
+  power2_cox_ney=matrix(NA, nrow = length(median1_drug), ncol = length(time))
+  power_tot_cox_ney=matrix(NA, nrow = length(median1_drug), ncol = length(time))
+
+  #####################################
+  #START CYCLE
+  #####################################
+  for (t in 1:length(time)) {
+  ti=time[t]
+  avgti=avgtime[t]
+  interim_ti=interim_time[t]
+  x=gsDesign(k = 2, test.type = 1, n.fix = E, beta = beta, alpha = alpha, sfu = sfLDOF, timing = c(ti,1))
+  za1=x$upper$bound[1]
+  E1=ceiling(x$n.I[1])
+  za2=x$upper$bound[2]
+  E2=ceiling(x$n.I[2])
+
+  for (q in 1:length(median1_drug)) {
+  lambdafu=lambda*fu_time
+  prob_1m=pexp(1, lambda)
+  prob_fum=pexp(1, lambdafu)
+  N=ceiling(E2/(prob_fum))
+  lambdaint=lambda*avgti
+  prob_1interim=pexp(1, lambdaint)
+  N1=ceiling((E2*ti)/(prob_1interim))
+  N2=ceiling(N-N1)
+  lambda1_drug <- log(2) / (median1_drug[q] * 30)
+  lambda2_drug <- log(2) / (median2_drug[q] * 30)
+
+# DEFINE ENROLMENT DATES
+  start_study = as.Date("2025/01/01")
+  end_study <- start_study %m+% months(tot_time)
+  
+  start_date1 <- start_study
+  end_date1 <- start_date1 %m+% months(interim_ti)-1
+  
+  start_date2 <- end_date1 + 1
+  end_date2 <- start_date2 %m+% months(enrol_time-interim_ti)
+
+ # DATASET 1 - FIRST GROUP
+  for (rep in 1:num_reps) {
+  dataset_p <- data.frame(id = 1:N1)
+  dates <- seq(start_date1, end_date1, "days")
+  sample_dates <- sample(dates, N1, replace = TRUE)
+  dataset_p$enrollment <- sort(sample_dates)
+  
+  update_dates <- generate_update_dates(start_date1, end_date1, interval_months = n_updates)
+  
+  p_update=c(0.5, rep(NA,length(update_dates)-1))
+  dataset1=dataset_p %>% filter(enrollment <= update_dates[2])
+  dataset1$interim_date=end_date1
+  dataset1$max_date <- as.Date(dataset1$enrollment + fu_days)
+  dataset1$max_date <- as.Date(ifelse(dataset1$max_date > dataset1$interim_date,dataset1$interim_date, dataset1$max_date))
+
+  # Calculate max time
+  dataset1$maxtime <- as.numeric(dataset1$max_date - dataset1$enrollment)
+  dataset1$trt=rbinom(dim(dataset1)[1], 1, p_update[1])
+  dataset1$update_date=update_dates[2]
+
+  # Simulate survival times
+  lambda1 <- log(2) / (median1 * 30)
+  lambda2 <- log(2) / (median2 * 30)
+
+  for (i in min(dataset1$id) : (min(dataset1$id) + dim(dataset1)[1]-1)) {
+      patient_indices <- dataset1$id == i
+      if (dataset1$trt[patient_indices][1] == 0) {
+        dataset1$survival_time[patient_indices] <- round(rexp(1, rate = lambda2))
+      } else {
+        dataset1$survival_time[patient_indices] <- round(rexp(1, rate = lambda1))
+      }
+    }
+
+    dataset1$event <- ifelse(dataset1$survival_time <= dataset1$maxtime, 1, 0)
+
+  # Observed time
+
+  dataset1$time <- pmin(dataset1$maxtime, dataset1$survival_time)
+  dataset1$time <- ifelse( dataset1$time==0,1, dataset1$time)
+
+  for (i in min(dataset1$id) : (min(dataset1$id) + dim(dataset1)[1]-1)) {
+      patient_indices <- dataset1$id == i
+      if (dataset1$trt[patient_indices][1] == 0) {
+        dataset1$reduction_time[patient_indices] <- round(rexp(1, rate = lambda2_drug))
+      } else {
+        dataset1$reduction_time[patient_indices] <- round(rexp(1, rate = lambda1_drug))
+      }
+    }
+
+dataset1$update_time=as.numeric(dataset1$update_date - dataset1$enrollment)
+dataset1$drug_reduction <- ifelse(dataset1$reduction_time <= dataset1$update_time & dataset1$reduction_time < dataset1$time, 1, 0)
+dataset1$reduction_time_obs <- pmin(dataset1$reduction_time, dataset1$update_time, dataset1$time)
+dataset1$reduction_time_obs <- ifelse(dataset1$reduction_time_obs==0,1,dataset1$reduction_time_obs)
+
+# ESTIMATION OF THE ALLOCATION PROBABILITY
+mean_est=survreg(Surv(reduction_time_obs, drug_reduction) ~ trt, dist = "exponential", data=dataset1)
+theta2 <- as.numeric(exp(mean_est$coefficients[1])) # Reference group (Treated)
+theta1 <- as.numeric(exp(mean_est$coefficients[1] + mean_est$coefficients[2]))
+
+    p_update[2]=theta1/(theta1+theta2)
+    dataset_tot=dataset1
+
+    for (u in 3:length(update_dates)) {
+
+    dataset1=dataset_p %>% filter(enrollment <= update_dates[u] & enrollment > update_dates[u-1])
+    dataset1$interim_date=end_date1
+    dataset1$max_date <- as.Date(dataset1$enrollment + fu_days)
+    dataset1$max_date <- as.Date(ifelse(dataset1$max_date > dataset1$interim_date,dataset1$interim_date, dataset1$max_date))
+
+    # Calculate max time
+    dataset1$maxtime <- as.numeric(dataset1$max_date - dataset1$enrollment)
+    dataset1$trt=rbinom(dim(dataset1)[1], 1, p_update[u-1])
+    dataset1$update_date=update_dates[u]
+
+     # Simulate survival times
+    lambda1 <- log(2) / (median1 * 30)
+    lambda2 <- log(2) / (median2 * 30)
+
+    for (i in min(dataset1$id) : (min(dataset1$id) + dim(dataset1)[1]-1)) {
+      patient_indices <- dataset1$id == i
+      if (dataset1$trt[patient_indices][1] == 0) {
+        dataset1$survival_time[patient_indices] <- round(rexp(1, rate = lambda2))
+      } else {
+        dataset1$survival_time[patient_indices] <- round(rexp(1, rate = lambda1))
+      }
+    }
+
+    dataset1$event <- ifelse(dataset1$survival_time <= dataset1$maxtime, 1, 0)
+
+    # Observed time
+
+    dataset1$time <- pmin(dataset1$maxtime, dataset1$survival_time)
+    dataset1$time <- ifelse( dataset1$time==0,1, dataset1$time)
+
+    for (i in min(dataset1$id) : (min(dataset1$id) + dim(dataset1)[1]-1)) {
+      patient_indices <- dataset1$id == i
+      if (dataset1$trt[patient_indices][1] == 0) {
+        dataset1$reduction_time[patient_indices] <- round(rexp(1, rate = lambda2_drug))
+      } else {
+        dataset1$reduction_time[patient_indices] <- round(rexp(1, rate = lambda1_drug))
+      }
+    }
+
+    dataset_tot=rbind(dataset_tot[,-((dim(dataset_tot)[2]-2):dim(dataset_tot)[2])], dataset1)
+    dataset_tot$update_date=update_dates[u]
+
+
+dataset_tot$update_time=as.numeric(dataset_tot$update_date - dataset_tot$enrollment)
+
+dataset_tot$drug_reduction <- ifelse(dataset_tot$reduction_time <= dataset_tot$update_time & dataset_tot$reduction_time < dataset_tot$time, 1, 0)
+
+dataset_tot$reduction_time_obs <- pmin(dataset_tot$reduction_time, dataset_tot$update_time, dataset_tot$time)
+
+dataset_tot$reduction_time_obs <- ifelse(dataset_tot$reduction_time_obs==0,1,dataset_tot$reduction_time_obs)
+
+# ESTIMATION OF THE ALLOCATION PROBABILITY
+mean_est=survreg(Surv(reduction_time_obs, drug_reduction) ~ trt, dist = "exponential", data=dataset_tot)
+theta2 <- as.numeric(exp(mean_est$coefficients[1])) # Reference group (Treated)
+theta1 <- as.numeric(exp(mean_est$coefficients[1] + mean_est$coefficients[2]))
+
+    p_update[u]=theta1/(theta1+theta2)
+
+    }
+    
+dataset1=dataset_tot
+
+dataset1$exit <- as.Date(dataset1$enrollment + dataset1$time)
+
+
+    # Cox proportional hazards model
+     cox <- coxph(Surv(time, event) ~ trt, data = dataset1)
+     c <- summary(cox)
+    
+    Z1_cox_ney[rep] <- (log(c$coefficients[2])-log(HR0))/c$coefficients[3]
+
+    pi=as.numeric(prop.table(table(dataset1$trt))[2])
+
+
+  # DATASET 2 - SECOND GROUP
+
+  dataset_p <- data.frame(id = (N1+1):N)
+  dates <- seq(start_date2, end_date2, "days")
+  sample_dates <- sample(dates, N2, replace = TRUE)
+  dataset_p$enrollment <- sort(sample_dates)
+
+  # allocation update interims
+
+  update_dates2 <- generate_update_dates(start_date2, end_date2, interval_months = n_updates)
+  update_dates2=update_dates2[-length(update_dates2)]
+
+
+    p_update1=p_update
+    p_update2=c(tail(p_update1, 1), rep(NA,length(update_dates2)-1))
+    dataset2=subset(dataset_p, enrollment <= update_dates2[2] & enrollment > tail(update_dates, 1))
+
+    dataset2$interim_date=end_study
+    dataset2$max_date <- as.Date(dataset2$enrollment + fu_days)
+    dataset2$max_date <- as.Date(ifelse(dataset2$max_date > dataset2$interim_date,dataset2$interim_date, dataset2$max_date))
+
+    # Calculate max time
+    dataset2$maxtime <- as.numeric(dataset2$max_date - dataset2$enrollment)
+
+    dataset2$trt=rbinom(dim(dataset2)[1], 1, p_update2[1])
+    dataset2$update_date=update_dates2[2]
+
+    # Simulate survival times
+    lambda1 <- log(2) / (median1 * 30)
+    lambda2 <- log(2) / (median2 * 30)
+
+    for (i in min(dataset2$id) : (min(dataset2$id) + dim(dataset2)[1]-1)) {
+      patient_indices <- dataset2$id == i
+      if (dataset2$trt[patient_indices][1] == 0) {
+        dataset2$survival_time[patient_indices] <- round(rexp(1, rate = lambda2))
+      } else {
+        dataset2$survival_time[patient_indices] <- round(rexp(1, rate = lambda1))
+      }
+    }
+
+    dataset2$event <- ifelse(dataset2$survival_time <= dataset2$maxtime, 1, 0)
+
+    # Observed time
+
+    dataset2$time <- pmin(dataset2$maxtime, dataset2$survival_time)
+
+    dataset2$time <- ifelse( dataset2$time==0,1, dataset2$time)
+
+    for (i in  min(dataset2$id) : (min(dataset2$id) + dim(dataset2)[1]-1)) {
+      patient_indices <- dataset2$id == i
+      if (dataset2$trt[patient_indices][1] == 0) {
+        dataset2$reduction_time[patient_indices] <- round(rexp(1, rate = lambda2_drug))
+      } else {
+        dataset2$reduction_time[patient_indices] <- round(rexp(1, rate = lambda1_drug))
+      }
+    }
+
+    dataset2=rbind(dataset1[,-((dim(dataset1)[2]-3):dim(dataset1)[2])], dataset2)
+
+    dataset2$interim_date=end_study
+    dataset2$max_date <- as.Date(dataset2$enrollment + fu_days)
+    dataset2$max_date <- as.Date(ifelse(dataset2$max_date > dataset2$interim_date,          dataset2$interim_date, dataset2$max_date))
+    dataset2$maxtime <- as.numeric(dataset2$max_date - dataset2$enrollment)
+    dataset2$update_date=update_dates2[2]
+
+     dataset2$event <- ifelse(dataset2$survival_time <= dataset2$maxtime, 1, 0)
+
+    # Observed time
+
+    dataset2$time <- pmin(dataset2$maxtime, dataset2$survival_time)
+
+    dataset2$time <- ifelse( dataset2$time==0,1, dataset2$time)
+
+
+dataset2$update_time=as.numeric(dataset2$update_date - dataset2$enrollment)
+
+dataset2$drug_reduction <- ifelse(dataset2$reduction_time <= dataset2$update_time & dataset2$reduction_time < dataset2$time, 1, 0)
+
+dataset2$reduction_time_obs <- pmin(dataset2$reduction_time, dataset2$update_time, dataset2$time)
+
+dataset2$reduction_time_obs <- ifelse(dataset2$reduction_time_obs==0,1,dataset2$reduction_time_obs)
+
+mean_est=survreg(Surv(reduction_time_obs, drug_reduction) ~ trt, dist = "exponential", data=dataset2)
+theta2 <- as.numeric(exp(mean_est$coefficients[1])) # Reference group (Treated)
+theta1 <- as.numeric(exp(mean_est$coefficients[1] + mean_est$coefficients[2]))
+
+    p_update2[2]=theta1/(theta1+theta2)
+    dataset_tot=dataset2
+
+
+    for (u in 3:length(update_dates2)) {
+
+    dataset2=dataset_p %>% filter(enrollment <= update_dates2[u] & enrollment > update_dates2[u-1])
+    dataset2$interim_date=end_study
+    dataset2$max_date <- as.Date(dataset2$enrollment + fu_days)
+    dataset2$max_date <- as.Date(ifelse(dataset2$max_date > dataset2$interim_date,        dataset2$interim_date, dataset2$max_date))
+
+    # Calculate max time
+    dataset2$maxtime <- as.numeric(dataset2$max_date - dataset2$enrollment)
+    dataset2$trt=rbinom(dim(dataset2)[1], 1, p_update2[u-1])
+    dataset2$update_date=update_dates2[u]
+
+
+    # Simulate survival times
+    lambda1 <- log(2) / (median1 * 30)
+    lambda2 <- log(2) / (median2 * 30)
+
+    for (i in min(dataset2$id) : (min(dataset2$id) + dim(dataset2)[1]-1)) {
+      patient_indices <- dataset2$id == i
+      if (dataset2$trt[patient_indices][1] == 0) {
+        dataset2$survival_time[patient_indices] <- round(rexp(1, rate = lambda2))
+      } else {
+        dataset2$survival_time[patient_indices] <- round(rexp(1, rate = lambda1))
+      }
+    }
+
+    dataset2$event <- ifelse(dataset2$survival_time <= dataset2$maxtime, 1, 0)
+
+    # Observed time
+
+    dataset2$time <- pmin(dataset2$maxtime, dataset2$survival_time)
+
+    dataset2$time <- ifelse( dataset2$time==0,1, dataset2$time)
+
+
+
+      for (i in  min(dataset2$id) : (min(dataset2$id) + dim(dataset2)[1]-1)) {
+      patient_indices <- dataset2$id == i
+      if (dataset2$trt[patient_indices][1] == 0) {
+        dataset2$reduction_time[patient_indices] <- round(rexp(1, rate = lambda2_drug))
+      } else {
+        dataset2$reduction_time[patient_indices] <- round(rexp(1, rate = lambda1_drug))
+      }
+    }
+
+    dataset_tot=rbind(dataset_tot[,-((dim(dataset_tot)[2]-2):dim(dataset_tot)[2])], dataset2)
+    dataset_tot$update_date=update_dates2[u]
+
+dataset_tot$update_time=as.numeric(dataset_tot$update_date - dataset_tot$enrollment)
+
+dataset_tot$drug_reduction <- ifelse(dataset_tot$reduction_time <= dataset_tot$update_time & dataset_tot$reduction_time < dataset_tot$time, 1, 0)
+
+dataset_tot$reduction_time_obs <- pmin(dataset_tot$reduction_time, dataset_tot$update_time, dataset_tot$time)
+
+dataset_tot$reduction_time_obs <- ifelse(dataset_tot$reduction_time_obs==0,1,dataset_tot$reduction_time_obs)
+
+
+mean_est=survreg(Surv(reduction_time_obs, drug_reduction) ~ trt, dist = "exponential", data=dataset_tot)
+theta2 <- as.numeric(exp(mean_est$coefficients[1])) # Reference group (Treated)
+theta1 <- as.numeric(exp(mean_est$coefficients[1] + mean_est$coefficients[2]))
+
+    p_update2[u]=theta1/(theta1+theta2)
+
+    }
+
+  dataset2=dataset_tot
+
+
+  dataset2$exit <- as.Date(dataset2$enrollment + dataset2$time)
+
+     cox <- coxph(Surv(time, event) ~ trt, data = dataset2)
+     c <- summary(cox)
+    
+    Z2_cox_ney[rep] <- (log(c$coefficients[2])-log(HR0))/c$coefficients[3]
+
+    pi=as.numeric(prop.table(table(dataset2$trt))[2])
+
+    allocation_prob[rep]=pi
+    AE_num[rep]=sum(dataset2$drug_reduction)
+
+  }
+  
+  results_cox=as.data.frame(cbind(Z1_cox_ney<(-za1), Z2_cox_ney<(-za2)))
+  colnames(results_cox) <- c("IA1", "IA2")
+  mean_allocation_prob[q,t]=round(mean(allocation_prob),2)
+  mean_AE[q,t]=round(mean(AE_num),2)
+  sd_AE[q,t]=round(sd(AE_num),4)
+  filtered_results1 <- dim(results_cox %>% filter(IA1 == TRUE))[1]
+  power1_cox_ney[q,t]= filtered_results1/num_reps
+  filtered_results2 <- dim(results_cox %>% filter(IA1 == FALSE & IA2==TRUE))[1]
+  power2_cox_ney[q,t]= filtered_results2/num_reps
+  power_tot_cox_ney[q,t]=(filtered_results1+filtered_results2)/num_reps
+
+}
+  }
+  
+  
+  rownames(power1_cox_ney)=round(opt,2)
+  colnames(power1_cox_ney)=round(time,2)
+
+  rownames(power2_cox_ney)=round(opt,2)
+  colnames(power2_cox_ney)=round(time,2)
+
+  rownames(power_tot_cox_ney)=round(opt,2)
+  colnames(power_tot_cox_ney)=round(time,2)
+
+  rownames(mean_allocation_prob)=round(opt,2)
+  colnames(mean_allocation_prob)=round(time,2)
+  
+  
+  rownames(mean_AE)=round(opt,2)
+  colnames(mean_AE)=round(time,2)
+
+  rownames(sd_AE)=round(opt,2)
+  colnames(sd_AE)=round(time,2)
+
+```
+  
+  
+# RESULTS
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+
+
+# saveRDS(mean_allocation_prob, "mean_allocation_prob_s0_tie.Rds")
+# saveRDS(power1_cox_ney, "power1_cox_s0_tie.Rds")
+# saveRDS(power2_cox_ney, "power2_cox_s0_tie.Rds")
+# saveRDS(power_tot_cox_ney, "power_tot_cox_s0_tie.Rds")
+# saveRDS(mean_AE, "mean_AE_s0_tie.Rds")
+# saveRDS(sd_AE, "sd_AE_s0_tie.Rds")
+
+```

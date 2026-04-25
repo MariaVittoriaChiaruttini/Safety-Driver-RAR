@@ -1,0 +1,280 @@
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+
+library(survival)
+library(mvtnorm)
+library(lubridate)
+library(survival)
+library(survminer)
+library(rpact)
+library(dplyr)
+library(Hmisc)
+#library(coxed)
+library(gtsummary)
+library(gsDesign)
+library(dplyr)
+#library(MDBED)
+library(RColorBrewer)
+```
+
+# SAMPLE SIZE (Fixed)
+
+```{r, echo=FALSE, warning = FALSE}
+# Inputs
+zb <- -0.84        # Z-score for power (e.g., 80% power)
+za <- -1.645       # Z-score for significance level (e.g., alpha = 0.05)
+HR1 <- 1      
+HR0 =  1.25  # Hazard ratio under alternative hypothesis
+#m   = 0.3           # non-inferiority margin
+pi <- 0.5         # Allocation ratio (e.g., 1:1 randomization)
+pa=1             # probability of NOT censoring in arm A
+pb=1           # probability of NOT censoring in arm B
+
+A = (za+zb)^2 
+B= log(HR0)^2*pi*(1-pi)
+
+E=ceiling(A/B)
+E
+```
+
+# FIXED ALLOCATION PROPORTION
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+ set.seed(345)
+num_reps <- 5
+
+#INPUT
+
+  alpha=0.05
+  beta=0.2
+  start_study <- as.Date("2025/01/01")
+  tot_time=60 #months
+  enrol_time=48 #months
+  fu_time=12 #months
+  fu_days=12*30
+  time=c(0.20, 0.30, 0.40, 0.5)
+  interim_time=tot_time*time
+  
+  # Calculate the AVERAGE TIME OF FOLLOW-UP AT INTERIM
+  avgtime=rep(0,length(time)) 
+  for (m in 1:length(time)) {
+  maxtime= interim_time[m]
+  times <- 0:(maxtime-1)
+  probs <- punif(times, 0, maxtime, lower.tail = FALSE) - punif(times + 1, 0, maxtime,   lower.tail = FALSE)
+  weights <- if (maxtime > fu_time) {
+    c(0:fu_time, rep(fu_time, maxtime - (fu_time+1)))
+  } else {
+    0:(maxtime - 1)
+  }
+  avgtime[m]=round(sum(probs * weights),2) #months
+  }
+
+
+  fi =seq(1,3,0.25) #allocation ratio
+  p1=0.5
+  p=seq(0.5,0.8,0.05) #fi/(fi+1) # allocation probability TO PLUG IN
+
+ 
+  median1=10 # average median in months PER EXPERIMENTAL PFS
+  median2=10 # PFS CONTROL
+  median_null=8
+  lambda=log(2)/median2 #average lambda monthly (PFS)
+  margin=(1/(log(2)/(median2*30))) - (1/(log(2)/(median_null*30)))
+  
+  
+
+  
+  #PRESAVE VECTORS
+
+  Z1_cox_plug <- numeric(num_reps)
+  Z2_cox_plug  <- numeric(num_reps)
+  power1_cox_plug =matrix(NA, nrow = length(p), ncol = length(time))
+  power2_cox_plug =matrix(NA, nrow = length(p), ncol = length(time))
+  power_tot_cox_plug =matrix(NA, nrow = length(p), ncol = length(time))
+
+  #####################################
+  #START CYCLE
+  #####################################
+  for (t in 1:length(time)) {
+  ti=time[t]
+  avgti=avgtime[t]
+  interim_ti=interim_time[t]
+  x=gsDesign(k = 2, test.type = 1, n.fix = E, beta = beta, alpha = alpha, sfu = sfLDOF,   timing = c(ti,1))
+  za1=x$upper$bound[1]
+  E1=ceiling(x$n.I[1])
+  za2=x$upper$bound[2]
+  E2=ceiling(x$n.I[2])
+
+  for (q in 1:length(p)) {
+  lambdafu=lambda*fu_time
+  prob_1m=pexp(1, lambda)
+  prob_fum=pexp(1, lambdafu)
+  N=ceiling(E2/(prob_fum))
+  lambdaint=lambda*avgti 
+  prob_1interim=pexp(1, lambdaint)
+  N1=ceiling((E2*ti)/(prob_1interim))
+  N2=ceiling(N-N1)
+  pi=p[q]
+ 
+  # DATASET 1 - FIRST GROUP
+  for (rep in 1:num_reps) {
+  dataset1 <- data.frame(id = 1:N1, trt = rbinom(N1, 1, pi))
+
+    nt <- table(dataset1$trt)[2]
+    nc <- table(dataset1$trt)[1]
+
+    # Enrollment dates
+
+    end_study <- start_study %m+% months(tot_time)
+    start_date <- start_study
+    end_date <- start_date %m+% months(interim_ti)-1
+    dates <- seq(start_date, end_date, "days")
+    sample_dates <- sample(dates, N1, replace = TRUE)
+    dataset1$enrollment <- sort(sample_dates)
+
+    # Calculate max date
+    dataset1$max_date <- as.Date(dataset1$enrollment + fu_days)
+    dataset1$max_date <- as.Date(ifelse(dataset1$max_date > end_date, end_date, dataset1$max_date))
+
+    # Calculate max time
+    dataset1$maxtime <- as.numeric(dataset1$max_date - dataset1$enrollment)
+
+    # Simulate survival times
+    lambda1 <- log(2) / (median1 * 30)
+    lambda2 <- log(2) / (median2 * 30)
+
+    for (i in 1:N1) {
+      patient_indices <- dataset1$id == i
+      if (dataset1$trt[patient_indices][1] == 0) {
+        dataset1$survival_time[patient_indices] <- round(rexp(1, rate = lambda2))
+      } else {
+        dataset1$survival_time[patient_indices] <- round(rexp(1, rate = lambda1))
+      }
+    }
+
+    # Event determination
+    dataset1$event <- ifelse(dataset1$survival_time <= dataset1$maxtime, 1, 0)
+
+    # Observed time
+    dataset1$time <- pmin(dataset1$maxtime, dataset1$survival_time)
+
+    dataset1$time <- ifelse( dataset1$time==0,1, dataset1$time)
+    dataset1$exit <- as.Date(dataset1$enrollment + dataset1$time)
+
+    # Cox proportional hazards model
+     cox <- coxph(Surv(time, event) ~ trt, data = dataset1)
+     c <- summary(cox)
+    
+     median_est <- survfit(Surv(time, event) ~ trt, data = dataset1)
+     median_est_summary <- summary(median_est)
+     n1=median_est_summary$table[1,4]+median_est_summary$table[2,4]
+
+     mean_est=survreg(Surv(time, event) ~ trt, dist = "exponential", data=dataset1)
+     theta2 <- as.numeric(exp(mean_est$coefficients[1])) # Reference group (Treated)
+     theta1 <- as.numeric(exp(mean_est$coefficients[1] + mean_est$coefficients[2]))
+
+    # Extract ZVALUE
+    Z1_cox_plug[rep] <- (log(c$coefficients[2])-log(HR0))/c$coefficients[3]
+    
+    # DATASET 2 - SECOND GROUP
+
+    dataset2 <- data.frame(id = 1:N2, trt = rbinom(N2, 1, pi))
+
+    nt <- table(dataset2$trt)[2]
+    nc <- table(dataset2$trt)[1]
+
+    # Enrollment dates
+    start_date <- end_date +1
+    end_date <- start_date %m+% months(enrol_time-interim_ti)
+    dates <- seq(start_date, end_date, "days")
+    sample_dates <- sample(dates, N2, replace = TRUE)
+    dataset2$enrollment <- sort(sample_dates)
+
+    # Calculate max date
+    dataset2$max_date <- as.Date(dataset2$enrollment + fu_days)
+    dataset2$max_date <- as.Date(ifelse(dataset2$max_date > end_study, end_study, dataset2$max_date))
+
+    # Calculate max time
+    dataset2$maxtime <- as.numeric(dataset2$max_date - dataset2$enrollment)
+
+    # Simulate survival times
+    lambda1 <- log(2) / (median1 * 30)
+    lambda2 <- log(2) / (median2 * 30)
+
+    for (i in 1:N2) {
+      patient_indices <- dataset2$id == i
+      if (dataset2$trt[patient_indices][1] == 0) {
+        dataset2$survival_time[patient_indices] <- round(rexp(1, rate = lambda2))
+      } else {
+        dataset2$survival_time[patient_indices] <- round(rexp(1, rate = lambda1))
+      }
+    }
+
+    # Event determination
+    dataset2$event <- ifelse(dataset2$survival_time <= dataset2$maxtime, 1, 0)
+
+    # Observed time
+    dataset2$time <- pmin(dataset2$maxtime, dataset2$survival_time)
+
+    dataset2$time <- ifelse( dataset2$time==0,1, dataset2$time)
+    dataset2$exit <- as.Date(dataset2$enrollment + dataset2$time)
+
+#complete dataset 1
+    dataset1$max_date <- as.Date(dataset1$enrollment + fu_days)
+    dataset1$max_date <- as.Date(ifelse(dataset1$max_date > end_study, end_study, dataset1$max_date))
+
+    # Calculate max time
+    dataset1$maxtime <- as.numeric(dataset1$max_date - dataset1$enrollment)
+
+    # Event determination
+    dataset1$event <- ifelse(dataset1$survival_time <= dataset1$maxtime, 1, 0)
+
+    # Observed time
+    dataset1$time <- pmin(dataset1$maxtime, dataset1$survival_time)
+
+    dataset1$time <- ifelse( dataset1$time==0,1, dataset1$time)
+    dataset1$exit <- as.Date(dataset1$enrollment + dataset1$time)
+
+    dataset=rbind(dataset1, dataset2)
+
+     cox <- coxph(Surv(time, event) ~ trt, data = dataset)
+     c <- summary(cox)
+    
+    # Extract ZVALUE
+    Z2_cox_plug[rep] <- (log(c$coefficients[2])-log(HR0))/c$coefficients[3]
+
+    }
+
+  #RESULTS
+
+
+  results_cox=as.data.frame(cbind(Z1_cox_plug <(-za1), Z2_cox_plug <(-za2)))
+  colnames(results_cox) <- c("IA1", "IA2")
+ 
+
+  filtered_results1 <- dim(results_cox %>% filter(IA1 == TRUE))[1]
+  power1_cox_plug[q,t]= filtered_results1/num_reps
+  filtered_results2 <- dim(results_cox %>% filter(IA1 == FALSE & IA2==TRUE))[1]
+  power2_cox_plug[q,t]= filtered_results2/num_reps
+  power_tot_cox_plug[q,t]=(filtered_results1+filtered_results2)/num_reps
+
+}
+  }
+  
+  #SAVE RESULTS
+
+  rownames(power1_cox_plug )=round(p,3)
+  colnames(power1_cox_plug )=round(time,3)
+
+  rownames(power2_cox_plug )=round(p,3)
+  colnames(power2_cox_plug )=round(time,3)
+
+  rownames(power_tot_cox_plug )=round(p,3)
+  colnames(power_tot_cox_plug )=round(time,3)
+  # 
+  # saveRDS(power1_cox_plug , "power1_cox_plug.Rds")
+  # saveRDS(power2_cox_plug , "power2_cox_plug.Rds")
+  # saveRDS(power_tot_cox_plug , "power_tot_cox_plug.Rds")
+
+```
+
